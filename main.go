@@ -18,7 +18,7 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-const DEFAULT_MODEL = "kimi-k2.5:cloud"
+const DEFAULT_MODEL = "qwen3.5:cloud"
 
 // FileContent holds the metadata and actual text of the file
 type FileContent struct {
@@ -182,7 +182,7 @@ func main() {
 	flag.Parse()
 
 	// Initialization
-	scanner, _ := NewScanner(*dirPtr, ".gitignore", []string{".go", ".html"})
+	scanner, _ := NewScanner(*dirPtr, ".gitignore", []string{".svelte", ".ts", ".go", ".html", ".sql"})
 	ai, err := NewAIClient()
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
