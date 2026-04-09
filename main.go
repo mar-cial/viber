@@ -3,15 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/glamour"
@@ -24,6 +23,38 @@ const DEFAULT_MODEL = "qwen3.5:cloud"
 type FileContent struct {
 	Path    string
 	Content string
+}
+
+// Add this to your FileScanner
+type FileIndex struct {
+	Path    string
+	Summary string // Optional: first 200 chars or function names
+	Ext     string
+}
+
+// New method: Build index without loading full content
+func (s *FileScanner) BuildIndex() ([]FileIndex, error) {
+	var index []FileIndex
+	err := filepath.WalkDir(s.Root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || s.IgnoredNames[d.Name()] {
+			return err
+		}
+		if !s.AllowedExts[filepath.Ext(path)] {
+			return nil
+		}
+		// Read only first 500 bytes for summary
+		f, _ := os.Open(path)
+		buf := make([]byte, 500)
+		f.Read(buf)
+		index = append(index, FileIndex{
+			Path:    path,
+			Summary: string(buf),
+			Ext:     filepath.Ext(path),
+		})
+		f.Close()
+		return nil
+	})
+	return index, err
 }
 
 // FileScanner handles the directory traversal logic
@@ -177,40 +208,153 @@ func (ai *AIClient) AskAboutRepo(ctx context.Context, repoContext string, userQu
 	return nil
 }
 
+func (s *Session) AskQuestion(ctx context.Context, question string) error {
+	// PHASE 1: Select
+	fmt.Println("\033[90m🔍 Analyzing repository structure...\033[0m")
+	relevantPaths, err := s.selectRelevantFiles(ctx, question)
+	if err != nil {
+		return err
+	}
+
+	// >>> REQUIREMENT: Return/List the files to the user
+	if len(relevantPaths) > 0 {
+		fmt.Println("\033[33m📄 Relevant Files Identified:\033[0m")
+		for _, p := range relevantPaths {
+			fmt.Printf("   - %s\n", p)
+		}
+	} else {
+		fmt.Println("\033[33m📄 No specific files identified, using general context.\033[0m")
+	}
+
+	// PHASE 2: Load Content
+	var builder strings.Builder
+	for _, path := range relevantPaths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		builder.WriteString(fmt.Sprintf("\n--- FILE: %s ---\n%s\n", path, content))
+	}
+
+	// PHASE 3: Ask
+	fmt.Println("\033[90m🤖 Generating answer...\033[0m")
+	return s.ai.AskAboutRepo(ctx, builder.String(), question)
+}
+
+// Store index for later filtering
+type Session struct {
+	scanner *FileScanner
+	index   []FileIndex
+	ai      *AIClient
+}
+
+func (s *Session) selectRelevantFiles(ctx context.Context, question string) ([]string, error) {
+	// 1. Prepare Index Context (Path + Summary)
+	var indexContext strings.Builder
+	for _, idx := range s.index {
+		// Truncate summary to keep token count low during selection
+		summary := idx.Summary
+		if len(summary) > 100 {
+			summary = summary[:100] + "..."
+		}
+		indexContext.WriteString(fmt.Sprintf("- %s (%s): %s\n", idx.Path, idx.Ext, summary))
+	}
+
+	// 2. Prompt specifically for JSON list of paths
+	prompt := fmt.Sprintf(`Here is a list of files in the repository with summaries.
+    Based on the question, return a JSON array of file paths that are relevant.
+    Do not include any explanation, only the JSON array.
+
+    INDEX:
+    %s
+
+    QUESTION: %s
+
+    RESPONSE (JSON Array):`, indexContext.String(), question)
+
+	// 3. Call LLM directly (bypass markdown renderer for parsing)
+	req := &api.ChatRequest{
+		Model: DEFAULT_MODEL,
+		Messages: []api.Message{
+			{Role: "system", Content: "You are a file selection engine. Return ONLY a JSON array of strings."},
+			{Role: "user", Content: prompt},
+		},
+		Stream: new(bool), // False
+	}
+
+	var responseContent strings.Builder
+	err := s.ai.client.Chat(ctx, req, func(res api.ChatResponse) error {
+		responseContent.WriteString(res.Message.Content)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. Parse JSON result
+	var paths []string
+	// Clean up markdown code blocks if the model adds them despite instructions
+	cleanJson := strings.ReplaceAll(responseContent.String(), "```json", "")
+	cleanJson = strings.ReplaceAll(cleanJson, "```", "")
+
+	err = json.Unmarshal([]byte(cleanJson), &paths)
+	if err != nil {
+		// Fallback: treat as newline separated if JSON fails
+		paths = strings.Split(cleanJson, "\n")
+	}
+
+	// 5. Filter paths to ensure they exist in our index (Safety check)
+	validPaths := make([]string, 0)
+	indexMap := make(map[string]bool)
+	for _, idx := range s.index {
+		indexMap[idx.Path] = true
+	}
+
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if indexMap[p] {
+			validPaths = append(validPaths, p)
+		}
+	}
+
+	return validPaths, nil
+}
+
 func main() {
 	dirPtr := flag.String("dir", ".", "The directory to analyze")
 	flag.Parse()
 
-	// Initialization
-	scanner, _ := NewScanner(*dirPtr, ".gitignore", []string{".svelte", ".ts", ".go", ".html", ".sql"})
-	ai, err := NewAIClient()
+	// 1. Initialize Components
+	scanner, err := NewScanner(*dirPtr, ".gitignore", []string{".svelte", ".ts", ".go", ".html", ".sql"})
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Printf("Scanner Error: %v\n", err)
 		return
 	}
 
-	// 1. Scan Files
-	start := time.Now()
-	var fileCount int64
-	var mu sync.Mutex
-	var builder strings.Builder
-
-	fmt.Printf("\033[36m📂 Scanning %s...\033[0m\n", *dirPtr)
-
-	process := func(fc FileContent) {
-		atomic.AddInt64(&fileCount, 1)
-		mu.Lock()
-		builder.WriteString(fmt.Sprintf("\n--- FILE: %s ---\n%s\n", fc.Path, fc.Content))
-		mu.Unlock()
+	ai, err := NewAIClient()
+	if err != nil {
+		fmt.Printf("AI Client Error: %v\n", err)
+		return
 	}
 
-	_ = scanner.ScanForAI(runtime.NumCPU(), process)
-	repoContext := builder.String()
+	// 2. Build Index (Lightweight)
+	fmt.Printf("\033[36m📂 Building Index for %s...\033[0m\n", *dirPtr)
+	index, err := scanner.BuildIndex()
+	if err != nil {
+		fmt.Printf("Index Error: %v\n", err)
+		return
+	}
+	fmt.Printf("\033[32m✅ Indexed %d files\033[0m\n", len(index))
 
-	fmt.Printf("\033[32m✅ %d files loaded into context (%v)\033[0m\n", fileCount, time.Since(start))
+	// 3. Create Session (Wires Index + AI + Scanner)
+	session := &Session{
+		scanner: scanner,
+		index:   index,
+		ai:      ai,
+	}
+
+	// 4. Interactive Loop
 	fmt.Println("\033[90mType 'exit' or 'quit' to close the session.\033[0m")
-
-	// 2. Interactive Loop
 	inputScanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("\n\033[1;34m❯\033[0m ")
@@ -226,10 +370,15 @@ func main() {
 			continue
 		}
 
-		fmt.Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
-		if err := ai.AskAboutRepo(context.Background(), repoContext, userInput); err != nil {
+		fmt.
+			Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
+
+		// >>> USE SESSION FLOW INSTEAD OF RAW AI CALL
+		if err := session.AskQuestion(context.Background(), userInput); err != nil {
 			fmt.Printf("\033[31mAI Error: %v\033[0m\n", err)
 		}
-		fmt.Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
+
+		fmt.
+			Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
 	}
 }
