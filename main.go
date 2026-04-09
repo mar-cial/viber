@@ -32,18 +32,40 @@ type FileIndex struct {
 	Ext     string
 }
 
-// New method: Build index without loading full content
 func (s *FileScanner) BuildIndex() ([]FileIndex, error) {
 	var index []FileIndex
 	err := filepath.WalkDir(s.Root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || s.IgnoredNames[d.Name()] {
+		if err != nil {
 			return err
 		}
+
+		// ✅ Skip ignored directories (prevents walking into them)
+		if d.IsDir() {
+			if s.IgnoredNames[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip disallowed extensions
 		if !s.AllowedExts[filepath.Ext(path)] {
 			return nil
 		}
+
+		// Check .gitignore patterns
+		for _, p := range s.Patterns {
+			if matched, _ := filepath.Match(p, d.Name()); matched {
+				return nil
+			}
+		}
+
 		// Read only first 500 bytes for summary
-		f, _ := os.Open(path)
+		f, err := os.Open(path)
+		if err != nil {
+			return nil
+		}
+		defer f.Close()
+
 		buf := make([]byte, 500)
 		f.Read(buf)
 		index = append(index, FileIndex{
@@ -51,7 +73,7 @@ func (s *FileScanner) BuildIndex() ([]FileIndex, error) {
 			Summary: string(buf),
 			Ext:     filepath.Ext(path),
 		})
-		f.Close()
+
 		return nil
 	})
 	return index, err
@@ -67,9 +89,19 @@ type FileScanner struct {
 
 func NewScanner(root string, ignoreFile string, extensions []string) (*FileScanner, error) {
 	s := &FileScanner{
-		Root:         root,
-		IgnoredNames: map[string]bool{".git": true, "node_modules": true},
-		AllowedExts:  make(map[string]bool),
+		Root: root,
+		IgnoredNames: map[string]bool{
+			".git":         true,
+			"node_modules": true,
+			".svelte-kit":  true,
+			"build":        true,
+			"dist":         true,
+			".vercel":      true,
+			".next":        true,
+			"__pycache__":  true,
+			"vendor":       true,
+		},
+		AllowedExts: make(map[string]bool),
 	}
 	for _, ext := range extensions {
 		s.AllowedExts[ext] = true
