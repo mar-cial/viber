@@ -17,7 +17,8 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-const DEFAULT_MODEL = "qwen3.5:cloud"
+const DEFAULT_MODEL = "deepseek-v4-flash:cloud"
+const BIG_MODEL = "deepseek-v4-pro:cloud"
 
 // FileContent holds the metadata and actual text of the file
 type FileContent struct {
@@ -356,8 +357,10 @@ func main() {
 	dirPtr := flag.String("dir", ".", "The directory to analyze")
 	flag.Parse()
 
+	allowedExtensions := []string{".svelte", ".ts", ".go", ".html", ".sql", ".yml", "justfile", ".rs"}
+
 	// 1. Initialize Components
-	scanner, err := NewScanner(*dirPtr, ".gitignore", []string{".svelte", ".ts", ".go", ".html", ".sql"})
+	scanner, err := NewScanner(*dirPtr, ".gitignore", allowedExtensions)
 	if err != nil {
 		fmt.Printf("Scanner Error: %v\n", err)
 		return
