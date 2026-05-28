@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,8 +18,200 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
-const DEFAULT_MODEL = "deepseek-v4-flash:cloud"
+const DEFAULT_MODEL = "gemma4:31b-cloud"
 const BIG_MODEL = "deepseek-v4-pro:cloud"
+
+const CONFIG_DIR = ".ollama-interactive"
+const CONFIG_FILE = "config.json"
+
+// Config stores user preferences
+type Config struct {
+	DefaultModel string `json:"default_model"`
+	LastUsed     string `json:"last_used"`
+}
+
+func GetConfigPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	configDir := filepath.Join(home, ".config", CONFIG_DIR)
+
+	// Create directory if not exists
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return "", err
+	}
+
+	return filepath.Join(configDir, CONFIG_FILE), nil
+}
+
+// LoadConfig loads the configuration from file
+func LoadConfig() (*Config, error) {
+	configPath, err := GetConfigPath()
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{DefaultModel: DEFAULT_MODEL}, nil
+		}
+		return nil, err
+	}
+
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return &Config{DefaultModel: DEFAULT_MODEL}, nil
+	}
+
+	if config.DefaultModel == "" {
+		config.DefaultModel = DEFAULT_MODEL
+	}
+
+	return &config, nil
+}
+
+// SaveConfig saves the configuration to file
+func SaveConfig(config *Config) error {
+	configPath, err := GetConfigPath()
+	if err != nil {
+		return err
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(configPath, data, 0644)
+}
+
+// ListModels fetches available models from Ollama
+func ListModels(client *api.Client) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var models []string
+	for _, model := range resp.Models {
+		models = append(models, model.Name)
+	}
+
+	return models, nil
+}
+
+// SelectModel shows interactive model selection
+func SelectModel(models []string, defaultModel string) (string, error) {
+	fmt.Println("\033[36m📋 Modelos Disponibles:\033[0m")
+
+	for i, m := range models {
+		fmt.Printf("   \033[90m[%d]\033[0m %s", i+1, m)
+		if m == defaultModel {
+			fmt.Printf(" \033[32m(default)\033[0m")
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("\n\033[90mPresiona Enter para usar el default, o escribe el número del modelo:\033[0m")
+	fmt.Print("\033[1;34m❯\033[0m ")
+
+	inputScanner := bufio.NewScanner(os.Stdin)
+	if !inputScanner.Scan() {
+		return defaultModel, nil
+	}
+
+	input := strings.TrimSpace(inputScanner.Text())
+
+	// Empty input = use default
+	if input == "" {
+		return defaultModel, nil
+	}
+
+	// Parse number
+	idx, err := strconv.Atoi(input)
+	if err != nil || idx < 1 || idx > len(models) {
+		fmt.Printf("\033[31m❌ Selección inválida, usando default: %s\033[0m\n", defaultModel)
+		return defaultModel, nil
+	}
+
+	selected := models[idx-1]
+	fmt.Printf("\033[32m✅ Modelo seleccionado: %s\033[0m\n", selected)
+	return selected, nil
+}
+
+type AIClient struct {
+	client   *api.Client
+	renderer *glamour.TermRenderer
+	Model    string // ← Agregar campo para el modelo seleccionado
+}
+
+// Agrega esto en Session para permitir cambiar modelo
+func (s *Session) ChangeModel(newModel string) {
+	s.ai.UpdateModel(newModel)
+	fmt.Printf("\033[32m✅ Modelo cambiado a: %s\033[0m\n", newModel)
+}
+
+func NewAIClient(model string) (*AIClient, error) {
+	client, err := api.ClientFromEnvironment()
+	if err != nil {
+		return nil, err
+	}
+	r, _ := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(100),
+	)
+	return &AIClient{
+		client:   client,
+		renderer: r,
+		Model:    model, // ← Usar modelo pasado como parámetro
+	}, nil
+}
+
+// UpdateModel allows changing the model during session
+func (ai *AIClient) UpdateModel(model string) {
+	ai.Model = model
+}
+
+func (ai *AIClient) AskAboutRepo(ctx context.Context, repoContext string, userQuestion string) error {
+	systemMsg := api.Message{
+		Role:    "system",
+		Content: "You are a Senior Software Engineer. Use the provided codebase to answer questions. Use Markdown for all formatting (code blocks, bold, headers).",
+	}
+	userMsg := api.Message{
+		Role:    "user",
+		Content: fmt.Sprintf("CODEBASE:\n%s\n\nQUESTION: %s", repoContext, userQuestion),
+	}
+
+	done := make(chan bool)
+	go ai.playSpinner(ctx, done)
+
+	var fullResponse strings.Builder
+	req := &api.ChatRequest{
+		Model:    ai.Model, // ← Usar el modelo almacenado en la instancia
+		Messages: []api.Message{systemMsg, userMsg},
+		Stream:   new(bool),
+	}
+
+	err := ai.client.Chat(ctx, req, func(res api.ChatResponse) error {
+		fullResponse.WriteString(res.Message.Content)
+		return nil
+	})
+
+	done <- true
+
+	if err != nil {
+		return err
+	}
+
+	out, _ := ai.renderer.Render(fullResponse.String())
+	fmt.Println(out)
+	return nil
+}
 
 // FileContent holds the metadata and actual text of the file
 type FileContent struct {
@@ -167,24 +360,6 @@ func (s *FileScanner) ScanForAI(workerCount int, callback func(fc FileContent)) 
 	return err
 }
 
-// AIClient manages the connection to Ollama and Markdown rendering
-type AIClient struct {
-	client   *api.Client
-	renderer *glamour.TermRenderer
-}
-
-func NewAIClient() (*AIClient, error) {
-	client, err := api.ClientFromEnvironment()
-	if err != nil {
-		return nil, err
-	}
-	r, _ := glamour.NewTermRenderer(
-		glamour.WithAutoStyle(),
-		glamour.WithWordWrap(100),
-	)
-	return &AIClient{client: client, renderer: r}, nil
-}
-
 // Spinner shows a small animation while the AI is thinking
 func (ai *AIClient) playSpinner(ctx context.Context, done chan bool) {
 	frames := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
@@ -200,45 +375,6 @@ func (ai *AIClient) playSpinner(ctx context.Context, done chan bool) {
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-}
-
-func (ai *AIClient) AskAboutRepo(ctx context.Context, repoContext string, userQuestion string) error {
-	systemMsg := api.Message{
-		Role:    "system",
-		Content: "You are a Senior Software Engineer. Use the provided codebase to answer questions. Use Markdown for all formatting (code blocks, bold, headers).",
-	}
-	userMsg := api.Message{
-		Role:    "user",
-		Content: fmt.Sprintf("CODEBASE:\n%s\n\nQUESTION: %s", repoContext, userQuestion),
-	}
-
-	// Start the spinner in a background goroutine
-	done := make(chan bool)
-	go ai.playSpinner(ctx, done)
-
-	var fullResponse strings.Builder
-	req := &api.ChatRequest{
-		Model:    DEFAULT_MODEL, // Change to your preferred local model
-		Messages: []api.Message{systemMsg, userMsg},
-		Stream:   new(bool), // Set to false to render full Markdown correctly
-	}
-
-	err := ai.client.Chat(ctx, req, func(res api.ChatResponse) error {
-		fullResponse.WriteString(res.Message.Content)
-		return nil
-	})
-
-	// Stop the spinner
-	done <- true
-
-	if err != nil {
-		return err
-	}
-
-	// Render beautiful Markdown
-	out, _ := ai.renderer.Render(fullResponse.String())
-	fmt.Println(out)
-	return nil
 }
 
 func (s *Session) AskQuestion(ctx context.Context, question string) error {
@@ -359,20 +495,83 @@ func main() {
 
 	allowedExtensions := []string{".svelte", ".ts", ".go", ".html", ".sql", ".yml", "justfile", ".rs"}
 
-	// 1. Initialize Components
+	// 1. Cargar configuración
+	fmt.Println("\033[36m🔧 Cargando configuración...\033[0m")
+	config, err := LoadConfig()
+	if err != nil {
+		fmt.Printf("\033[33m⚠️  Error cargando config, usando defaults\033[0m\n")
+		config = &Config{DefaultModel: DEFAULT_MODEL}
+	}
+
+	// 2. Inicializar cliente AI temporal para listar modelos
+	tempAI, err := NewAIClient(config.DefaultModel)
+	if err != nil {
+		fmt.Printf("AI Client Error: %v\n", err)
+		return
+	}
+
+	fmt.Println("\033[36m🔍 Conectando con Ollama...\033[0m")
+	models, err := ListModels(tempAI.client)
+	if err != nil {
+		// ... existing error handling ...
+	}
+
+	// >>> NEW: Calculate defaultIdx in main
+	defaultIdx := -1
+	for i, m := range models {
+		if m == config.DefaultModel {
+			defaultIdx = i
+			break
+		}
+	}
+
+	if defaultIdx == -1 {
+		fmt.Printf("\033[33m⚠️  Default model '%s' not found in local models.\033[0m\n", config.
+			DefaultModel)
+	} else {
+		fmt.Printf("\033[32m✅ Default model found at index %d\033[0m\n", defaultIdx)
+	}
+
+	// 4. Selección de modelo (si hay más de uno)
+	selectedModel := config.DefaultModel
+	if len(models) > 1 {
+		selectedModel, err = SelectModel(models, config.DefaultModel)
+		if err != nil {
+			fmt.Printf("\033[33m⚠️  Error en selección, usando default\033[0m\n")
+			selectedModel = config.DefaultModel
+		}
+
+		// Preguntar si quiere guardar como default
+		if selectedModel != config.DefaultModel {
+			fmt.Print("\033[90m¿Guardar como modelo por defecto? (y/n): \033[0m")
+			inputScanner := bufio.NewScanner(os.Stdin)
+			if inputScanner.Scan() {
+				if strings.ToLower(strings.TrimSpace(inputScanner.Text())) == "y" {
+					config.DefaultModel = selectedModel
+					if err := SaveConfig(config); err != nil {
+						fmt.Printf("\033[33m⚠️  No se pudo guardar la configuración\033[0m\n")
+					} else {
+						fmt.Printf("\033[32m✅ Configuración guardada en ~/.config/%s/\033[0m\n", CONFIG_DIR)
+					}
+				}
+			}
+		}
+	}
+
+	// 5. Inicializar componentes con modelo seleccionado
 	scanner, err := NewScanner(*dirPtr, ".gitignore", allowedExtensions)
 	if err != nil {
 		fmt.Printf("Scanner Error: %v\n", err)
 		return
 	}
 
-	ai, err := NewAIClient()
+	ai, err := NewAIClient(selectedModel) // ← Usar modelo seleccionado
 	if err != nil {
 		fmt.Printf("AI Client Error: %v\n", err)
 		return
 	}
 
-	// 2. Build Index (Lightweight)
+	// 6. Build Index
 	fmt.Printf("\033[36m📂 Building Index for %s...\033[0m\n", *dirPtr)
 	index, err := scanner.BuildIndex()
 	if err != nil {
@@ -381,15 +580,17 @@ func main() {
 	}
 	fmt.Printf("\033[32m✅ Indexed %d files\033[0m\n", len(index))
 
-	// 3. Create Session (Wires Index + AI + Scanner)
+	// 7. Create Session
 	session := &Session{
 		scanner: scanner,
 		index:   index,
 		ai:      ai,
 	}
 
-	// 4. Interactive Loop
+	// 8. Interactive Loop
 	fmt.Println("\033[90mType 'exit' or 'quit' to close the session.\033[0m")
+	fmt.Println("\033[90mType 'model' to change the current model.\033[0m")
+
 	inputScanner := bufio.NewScanner(os.Stdin)
 	for {
 		fmt.Print("\n\033[1;34m❯\033[0m ")
@@ -401,19 +602,28 @@ func main() {
 		if userInput == "exit" || userInput == "quit" {
 			break
 		}
+
+		// ← Comando para cambiar modelo
+		if userInput == "model" {
+			newModel, err := SelectModel(models, session.ai.Model)
+			if err == nil && newModel != "" {
+				session.ChangeModel(newModel)
+				config.DefaultModel = newModel
+				SaveConfig(config)
+			}
+			continue
+		}
+
 		if userInput == "" {
 			continue
 		}
 
-		fmt.
-			Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
+		fmt.Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
 
-		// >>> USE SESSION FLOW INSTEAD OF RAW AI CALL
 		if err := session.AskQuestion(context.Background(), userInput); err != nil {
 			fmt.Printf("\033[31mAI Error: %v\033[0m\n", err)
 		}
 
-		fmt.
-			Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
+		fmt.Println("\033[90m────────────────────────────────────────────────────────────\033[0m")
 	}
 }
